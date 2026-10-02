@@ -6,16 +6,10 @@ import hashlib
 import hmac
 import time
 import threading
-from urllib.parse import urlparse
 
 import requests
 import resend
 from flask import Flask, request
-
-try:
-    from rapidfuzz import fuzz
-except ImportError:
-    fuzz = None
 
 
 app = Flask(__name__)
@@ -26,35 +20,18 @@ app = Flask(__name__)
 # ============================================================
 
 SHOPIFY_DOMAIN = os.environ.get("SHOPIFY_DOMAIN", "").strip()
-
-# Existing/static token support
 SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN", "").strip()
-
-# Optional Shopify client-credentials support
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "").strip()
 
-# Shopify webhook HMAC uses the Shopify Client Secret directly.
-# No separate SHOPIFY_WEBHOOK_SECRET environment variable is required.
-
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "").strip()
-
-# Can be changed in Render without editing code
-ANTHROPIC_MODEL = os.environ.get(
-    "ANTHROPIC_MODEL",
-    "claude-sonnet-5"
-).strip()
-
 ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "").strip()
 RESEND_KEY = os.environ.get("RESEND_KEY", "").strip()
-
-# Use your verified Resend sender in production.
-# onboarding@resend.dev can be used for initial testing where supported.
 RESEND_FROM = os.environ.get(
     "RESEND_FROM",
     "onboarding@resend.dev"
 ).strip()
 
+# Keep this configurable in Render. Shopify API versions are date-based.
 SHOPIFY_API_VERSION = os.environ.get(
     "SHOPIFY_API_VERSION",
     "2026-10"
@@ -65,11 +42,9 @@ SHOPIFY_API_VERSION = os.environ.get(
 # STATE
 # ============================================================
 
-# Prevent the same webhook from being processed twice
 processed_webhooks = set()
 processed_lock = threading.Lock()
 
-# Shopify client-credentials token cache
 shopify_token_cache = {
     "token": None,
     "expires_at": 0
@@ -79,14 +54,118 @@ shopify_token_lock = threading.Lock()
 
 
 # ============================================================
-# SAFETY KEYWORDS
+# PRINTORA APPROVED PRODUCT ALLOWLIST
+# ============================================================
+#
+# Only products that clearly match this list are automatically
+# approved. Everything else goes to manual review.
+#
+# Prohibited terms are checked FIRST, so an item such as
+# "phone stand gun mount" cannot pass just because it contains
+# "phone stand".
+#
+
+APPROVED_PRODUCT_TERMS = {
+    # Organization
+    "cable organizer",
+    "cable holder",
+    "cable clip",
+    "cable management",
+    "phone stand",
+    "tablet stand",
+    "desk organizer",
+    "desk tray",
+    "storage box",
+    "storage container",
+    "container",
+    "drawer organizer",
+    "desk accessory",
+    "pen holder",
+    "pencil holder",
+
+    # Holders / hooks
+    "hook",
+    "hanger",
+    "wall hook",
+    "key holder",
+    "key hook",
+    "tool holder",
+    "controller holder",
+    "headphone holder",
+    "headset holder",
+    "phone holder",
+
+    # Shelves / brackets
+    "shelf bracket",
+    "shelf support",
+    "mounting bracket",
+    "display stand",
+    "display holder",
+    "stand",
+
+    # 3D printing accessories
+    "filament holder",
+    "filament clip",
+    "filament guide",
+    "spool holder",
+    "spool adapter",
+    "spool clip",
+    "nozzle holder",
+    "nozzle stand",
+    "3d printer accessory",
+    "3d printing accessory",
+
+    # Toys / models
+    "toy",
+    "figurine",
+    "figure",
+    "miniature",
+    "model",
+    "display model",
+    "puzzle",
+    "game piece",
+    "board game accessory",
+
+    # RC / hobby
+    "rc car bracket",
+    "rc car mount",
+    "rc car body",
+    "rc car accessory",
+    "rc car part",
+    "hobby accessory",
+
+    # Electronics / projects
+    "electronics enclosure",
+    "project enclosure",
+    "sensor mount",
+    "camera mount",
+    "led holder",
+    "electronics holder",
+    "circuit board enclosure",
+
+    # Household
+    "plant pot",
+    "planter",
+    "flower pot",
+    "soap holder",
+    "toothbrush holder",
+    "bottle holder",
+    "cup holder",
+
+    # Decorative
+    "decoration",
+    "decorative",
+    "ornament",
+    "wall decoration",
+    "desk decoration",
+}
+
+
+# ============================================================
+# PROHIBITED / SAFETY REVIEW TERMS
 # ============================================================
 
-# These are intentionally broad because the goal is to send
-# suspicious products to MANUAL REVIEW, not automatically reject
-# legitimate products.
-
-DANGEROUS_TERMS = {
+PROHIBITED_TERMS = {
     # Firearms
     "gun",
     "guns",
@@ -101,6 +180,8 @@ DANGEROUS_TERMS = {
     "handgun",
     "handguns",
     "revolver",
+    "revolvers",
+    "machine gun",
     "machinegun",
     "smg",
 
@@ -127,8 +208,8 @@ DANGEROUS_TERMS = {
     "switchblades",
     "machete",
     "machetes",
+    "brass knuckles",
     "brassknuckles",
-    "brassknuckle",
     "knuckle duster",
     "knuckleduster",
     "crossbow",
@@ -140,16 +221,17 @@ DANGEROUS_TERMS = {
     "dagger",
     "daggers",
 
-    # Electrical weapons
+    # Electrical / chemical weapons
     "taser",
     "tasers",
+    "stun gun",
     "stungun",
+    "stun guns",
     "stunguns",
-
-    # Chemical/self-defense weapons
-    "pepperspray",
-    "peppersprays",
     "pepper spray",
+    "pepperspray",
+    "pepper sprays",
+    "peppersprays",
 
     # Weapon components / accessories
     "silencer",
@@ -163,11 +245,14 @@ DANGEROUS_TERMS = {
     "gunstocks",
     "receiver",
     "receivers",
-}
+    "firearm part",
+    "firearm parts",
+    "gun part",
+    "gun parts",
+    "weapon part",
+    "weapon parts",
 
-
-# Terms that are suspicious enough to require AI/manual review
-SUSPICIOUS_TERMS = {
+    # Suspicious context
     "weapon",
     "weapons",
     "tactical",
@@ -175,9 +260,14 @@ SUSPICIOUS_TERMS = {
     "ballistic",
     "armory",
     "arsenal",
-    "concealed",
+    "concealed weapon",
     "self defense",
+    "self-defense",
     "selfdefense",
+
+    # Drug equipment
+    "drug equipment",
+    "drug paraphernalia",
 }
 
 
@@ -199,135 +289,119 @@ LEET_TRANSLATION = str.maketrans({
 
 
 def normalize_text(text):
-    """
-    Makes text easier to compare.
-
-    Examples:
-        gUn       -> gun
-        G.U.N     -> gun
-        g u n     -> gun
-        gUn123    -> gun123
-        kn1fe     -> knife
-    """
-
     if not text:
         return ""
 
     text = str(text).lower()
-
-    # Normalize common leetspeak
     text = text.translate(LEET_TRANSLATION)
-
-    # Remove accents where possible
-    text = text.encode(
-        "ascii",
-        "ignore"
-    ).decode(
-        "ascii"
-    )
-
-    # Turn punctuation into spaces
-    text = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        text
-    )
-
-    # Collapse whitespace
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"s+", " ", text).strip()
 
     return text
 
 
-def compact_text(text):
+def contains_term(text, term):
     """
-    Removes spaces so:
-        'stun gun' -> 'stungun'
-        'pepper spray' -> 'pepperspray'
-    """
-
-    return normalize_text(text).replace(" ", "")
-
-
-# ============================================================
-# FUZZY MATCHING
-# ============================================================
-
-def fuzzy_keyword_match(text):
-    """
-    Detects misspellings and altered versions of dangerous terms.
-
-    Examples that can be caught:
-        gun
-        gunn
-        g u n
-        g.un
-        gUn
-        knief
-        wepon
-        pist0l
+    Exact normalized word/phrase matching only.
+    No fuzzy matching.
     """
 
-    normalized = normalize_text(text)
-    compact = compact_text(text)
+    normalized_text = normalize_text(text)
+    normalized_term = normalize_text(term)
 
-    if not normalized:
-        return None
+    if not normalized_text or not normalized_term:
+        return False
 
-    # Exact substring checks first
-    for term in DANGEROUS_TERMS:
-        term_normalized = normalize_text(term)
-        term_compact = compact_text(term)
+    pattern = (
+        r"(?<![a-z0-9])"
+        + re.escape(normalized_term)
+        + r"(?![a-z0-9])"
+    )
 
-        if term_normalized in normalized:
-            return f"Exact safety term: {term}"
+    return re.search(pattern, normalized_text) is not None
 
-        if term_compact and term_compact in compact:
-            return f"Normalized safety term: {term}"
 
-    # Fuzzy matching
-    if fuzz is None:
-        return None
-
-    words = normalized.split()
-
-    for term in DANGEROUS_TERMS:
-        term_normalized = normalize_text(term)
-
-        # Don't fuzzy-match extremely short terms aggressively.
-        # This reduces false positives.
-        if len(term_normalized) < 4:
-            continue
-
-        for word in words:
-
-            if len(word) < 3:
-                continue
-
-            score = fuzz.ratio(
-                word,
-                term_normalized
-            )
-
-            # Strong similarity
-            if score >= 88:
-                return (
-                    f"Fuzzy safety match: "
-                    f"{word} ~ {term} ({score:.0f}%)"
-                )
-
-            # Slightly more tolerant for longer words
-            if len(term_normalized) >= 7 and score >= 80:
-                return (
-                    f"Fuzzy safety match: "
-                    f"{word} ~ {term} ({score:.0f}%)"
-                )
+def find_prohibited_term(text):
+    for term in PROHIBITED_TERMS:
+        if contains_term(text, term):
+            return term
 
     return None
+
+
+def find_approved_term(text):
+    for term in APPROVED_PRODUCT_TERMS:
+        if contains_term(text, term):
+            return term
+
+    return None
+
+
+# ============================================================
+# PRODUCT SCREENING
+# ============================================================
+
+def screen_product(title):
+    """
+    APPROVED:
+        Product clearly matches the approved allowlist and
+        contains no prohibited term.
+
+    MANUAL REVIEW:
+        Product is unknown or contains a prohibited term.
+    """
+
+    title = str(title or "").strip()
+
+    if not title:
+        return False, "Product has no readable title"
+
+    prohibited = find_prohibited_term(title)
+
+    if prohibited:
+        return False, f"Prohibited/safety term detected: {prohibited}"
+
+    approved = find_approved_term(title)
+
+    if approved:
+        return True, f"Approved product category: {approved}"
+
+    return False, (
+        "Product does not match the Printora approved-product "
+        "allowlist"
+    )
+
+
+def classify_order(order):
+    """
+    Every line item must be clearly approved.
+
+    One unknown or prohibited item causes the entire order
+    to require manual review.
+    """
+
+    items = order.get("line_items", [])
+
+    if not items:
+        return False, (
+            "Order contains no readable line items; "
+            "manual review required"
+        )
+
+    reasons = []
+
+    for item in items:
+        title = item.get("title", "").strip()
+
+        approved, reason = screen_product(title)
+
+        if not approved:
+            return False, f"{title or 'Unknown product'}: {reason}"
+
+        reasons.append(f"{title}: {reason}")
+
+    return True, "All order items passed the approved-product allowlist"
 
 
 # ============================================================
@@ -335,31 +409,25 @@ def fuzzy_keyword_match(text):
 # ============================================================
 
 def get_shopify_token():
-    """
-    Supports:
-    1. Existing SHOPIFY_TOKEN
-    2. Shopify client-credentials flow
-
-    Client-credentials tokens expire after 24 hours, so the
-    application refreshes them automatically when needed.
-    """
-
-    # If we only have the existing token, use it.
-    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+    if SHOPIFY_TOKEN:
         return SHOPIFY_TOKEN
+
+    if not SHOPIFY_DOMAIN:
+        raise RuntimeError("SHOPIFY_DOMAIN is not configured")
+
+    if not SHOPIFY_CLIENT_ID:
+        raise RuntimeError("SHOPIFY_CLIENT_ID is not configured")
+
+    if not SHOPIFY_CLIENT_SECRET:
+        raise RuntimeError("SHOPIFY_CLIENT_SECRET is not configured")
 
     now = time.time()
 
     with shopify_token_lock:
-
         cached_token = shopify_token_cache["token"]
         expires_at = shopify_token_cache["expires_at"]
 
-        # Keep a safety margin before expiration
-        if (
-            cached_token
-            and expires_at > now + 300
-        ):
+        if cached_token and expires_at > now + 300:
             return cached_token
 
         token_url = (
@@ -370,16 +438,12 @@ def get_shopify_token():
         response = requests.post(
             token_url,
             headers={
-                "Content-Type":
-                    "application/x-www-form-urlencoded"
+                "Content-Type": "application/x-www-form-urlencoded"
             },
             data={
-                "client_id":
-                    SHOPIFY_CLIENT_ID,
-                "client_secret":
-                    SHOPIFY_CLIENT_SECRET,
-                "grant_type":
-                    "client_credentials",
+                "client_id": SHOPIFY_CLIENT_ID,
+                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "grant_type": "client_credentials",
             },
             timeout=20,
         )
@@ -387,31 +451,19 @@ def get_shopify_token():
         response.raise_for_status()
 
         data = response.json()
-
-        token = data.get(
-            "access_token"
-        )
-
-        expires_in = int(
-            data.get(
-                "expires_in",
-                86399
-            )
-        )
+        token = data.get("access_token")
 
         if not token:
             raise RuntimeError(
-                "Shopify did not return an access token."
+                "Shopify did not return an access token"
             )
 
-        shopify_token_cache["token"] = token
-        shopify_token_cache["expires_at"] = (
-            time.time() + expires_in
-        )
+        expires_in = int(data.get("expires_in", 86399))
 
-        print(
-            "Shopify access token refreshed."
-        )
+        shopify_token_cache["token"] = token
+        shopify_token_cache["expires_at"] = time.time() + expires_in
+
+        print("Shopify access token refreshed.")
 
         return token
 
@@ -422,11 +474,6 @@ def get_shopify_token():
 
 def shopify_graphql(query, variables=None):
     token = get_shopify_token()
-
-    if not token:
-        raise RuntimeError(
-            "No Shopify API token configured."
-        )
 
     url = (
         f"https://{SHOPIFY_DOMAIN}"
@@ -447,8 +494,7 @@ def shopify_graphql(query, variables=None):
         timeout=25,
     )
 
-    # If the cached token expired, try once more with a fresh token
-    if response.status_code == 401:
+    if response.status_code == 401 and not SHOPIFY_TOKEN:
         with shopify_token_lock:
             shopify_token_cache["token"] = None
             shopify_token_cache["expires_at"] = 0
@@ -474,24 +520,55 @@ def shopify_graphql(query, variables=None):
 
     if data.get("errors"):
         raise RuntimeError(
-            f"Shopify GraphQL error: "
-            f"{data['errors']}"
+            f"Shopify GraphQL error: {data['errors']}"
         )
 
     return data
 
 
 # ============================================================
-# SHOPIFY ORDER FLAGGING
+# HOLD ORDER FOR MANUAL REVIEW
 # ============================================================
 
 def hold_order(order_id, reason):
     """
-    Adds a safety-review tag and note.
-
-    This does NOT automatically cancel or refund the order.
-    It tells you that the order must be manually reviewed.
+    Adds review tags while preserving the order's existing tags.
+    Does not cancel or refund the order.
     """
+
+    query = """
+    query GetOrderTags($id: ID!) {
+        order(id: $id) {
+            id
+            tags
+        }
+    }
+    """
+
+    existing_result = shopify_graphql(
+        query,
+        {"id": order_id}
+    )
+
+    existing_order = (
+        existing_result
+        .get("data", {})
+        .get("order")
+    )
+
+    existing_tags = (
+        existing_order.get("tags", [])
+        if existing_order
+        else []
+    )
+
+    tags = list(dict.fromkeys(
+        existing_tags
+        + [
+            "FLAGGED-DANGEROUS",
+            "MANUAL-REVIEW",
+        ]
+    ))
 
     mutation = """
     mutation OrderUpdate($input: OrderInput!) {
@@ -519,20 +596,15 @@ def hold_order(order_id, reason):
         "the product."
     )
 
-    variables = {
-        "input": {
-            "id": order_id,
-            "tags": [
-                "FLAGGED-DANGEROUS",
-                "MANUAL-REVIEW"
-            ],
-            "note": note,
-        }
-    }
-
     result = shopify_graphql(
         mutation,
-        variables
+        {
+            "input": {
+                "id": order_id,
+                "tags": tags,
+                "note": note,
+            }
+        }
     )
 
     payload = (
@@ -541,399 +613,14 @@ def hold_order(order_id, reason):
         .get("orderUpdate", {})
     )
 
-    errors = payload.get(
-        "userErrors",
-        []
-    )
+    errors = payload.get("userErrors", [])
 
     if errors:
         raise RuntimeError(
-            f"Shopify order update errors: "
-            f"{errors}"
+            f"Shopify order update errors: {errors}"
         )
 
     return True
-
-
-# ============================================================
-# GET PRODUCT IMAGE
-# ============================================================
-
-def get_product_image(product_id):
-    """
-    Gets the product's featured image from Shopify.
-
-    Image screening is optional. If an image cannot be retrieved,
-    the order is still screened using text + AI.
-    """
-
-    if not product_id:
-        return None
-
-    query = """
-    query ProductImage($id: ID!) {
-        product(id: $id) {
-            id
-            title
-            featuredImage {
-                url
-            }
-        }
-    }
-    """
-
-    try:
-        result = shopify_graphql(
-            query,
-            {
-                "id": product_id
-            }
-        )
-
-        product = (
-            result
-            .get("data", {})
-            .get("product")
-        )
-
-        if not product:
-            return None
-
-        image = product.get(
-            "featuredImage"
-        )
-
-        if not image:
-            return None
-
-        return image.get("url")
-
-    except Exception as error:
-        print(
-            f"Product image lookup failed: {error}"
-        )
-        return None
-
-
-# ============================================================
-# AI SCREENING
-# ============================================================
-
-def ai_screen_order(items):
-    """
-    Sends product names and, when available, product images
-    to Anthropic.
-
-    The AI is instructed to return JSON only.
-    """
-
-    if not ANTHROPIC_KEY:
-        return True, (
-            "AI screening unavailable; "
-            "manual review required"
-        )
-
-    product_blocks = []
-
-    image_urls = []
-
-    for item in items:
-
-        title = item.get(
-            "title",
-            "Unknown product"
-        )
-
-        product_id = item.get(
-            "product_id"
-        )
-
-        image_url = None
-
-        if product_id:
-            image_url = get_product_image(
-                f"gid://shopify/Product/{product_id}"
-            )
-
-        product_blocks.append(
-            {
-                "title": title,
-                "image_available": bool(
-                    image_url
-                )
-            }
-        )
-
-        if image_url:
-            image_urls.append(
-                {
-                    "title": title,
-                    "url": image_url
-                }
-            )
-
-    system_prompt = """
-You are the safety screening system for Printora Labs 3D.
-
-Your job is to identify products that require HUMAN MANUAL REVIEW.
-
-Flag products involving:
-- firearms
-- firearm parts
-- ammunition
-- weapon construction
-- explosives
-- explosive components
-- dangerous weapons
-- weapon accessories
-- tasers or stun weapons
-- pepper spray or similar weapons
-- other products whose intended purpose is to harm a person
-- illegal drug equipment
-- sexually explicit products
-- other clearly dangerous or prohibited products
-
-Important:
-- Do NOT assume every ordinary household object is dangerous.
-- A kitchen utensil or ordinary tool is not automatically a weapon.
-- If the intended use is ambiguous, flag it for manual review.
-- Misspellings and disguised wording should still be considered.
-- Never approve an uncertain product.
-- This system flags products for human review; it does not make a final legal determination.
-
-Return ONLY valid JSON:
-
-{
-  "flag": true or false,
-  "confidence": 0-100,
-  "reason": "short explanation"
-}
-"""
-
-    user_content = [
-        {
-            "type": "text",
-            "text": (
-                "Review these products:\n\n"
-                + json.dumps(
-                    product_blocks,
-                    indent=2
-                )
-            )
-        }
-    ]
-
-    # Add publicly accessible Shopify images when available
-    for image in image_urls:
-
-        try:
-            parsed = urlparse(
-                image["url"]
-            )
-
-            if parsed.scheme not in (
-                "http",
-                "https"
-            ):
-                continue
-
-            user_content.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"Product image for: "
-                        f"{image['title']}"
-                    )
-                }
-            )
-
-            user_content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "url",
-                        "url": image["url"]
-                    }
-                }
-            )
-
-        except Exception:
-            continue
-
-    try:
-
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version":
-                    "2023-06-01",
-                "content-type":
-                    "application/json",
-            },
-            json={
-                "model":
-                    ANTHROPIC_MODEL,
-                "max_tokens":
-                    300,
-                "system":
-                    system_prompt,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content":
-                            user_content,
-                    }
-                ],
-            },
-            timeout=45,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        content = data.get(
-            "content",
-            []
-        )
-
-        text_parts = []
-
-        for block in content:
-            if block.get("type") == "text":
-                text_parts.append(
-                    block.get("text", "")
-                )
-
-        answer = "".join(
-            text_parts
-        ).strip()
-
-        # Remove accidental markdown fences
-        answer = re.sub(
-            r"^```json\s*",
-            "",
-            answer,
-            flags=re.IGNORECASE
-        )
-
-        answer = re.sub(
-            r"\s*```$",
-            "",
-            answer
-        )
-
-        result = json.loads(
-            answer
-        )
-
-        flagged = bool(
-            result.get("flag")
-        )
-
-        confidence = result.get(
-            "confidence",
-            0
-        )
-
-        reason = result.get(
-            "reason",
-            "AI screening result"
-        )
-
-        # Never automatically approve an
-        # uncertain/high-risk AI result.
-        if flagged:
-            return True, (
-                f"AI flagged product "
-                f"(confidence {confidence}%): "
-                f"{reason}"
-            )
-
-        # Require a reasonably confident clean result.
-        if confidence < 85:
-            return True, (
-                "AI result was not sufficiently "
-                "confident for automatic approval"
-            )
-
-        return False, (
-            f"AI screening passed "
-            f"(confidence {confidence}%)"
-        )
-
-    except Exception as error:
-
-        # FAIL CLOSED
-        return True, (
-            f"AI screening error; "
-            f"manual review required: {error}"
-        )
-
-
-# ============================================================
-# COMPLETE ORDER SCREENING
-# ============================================================
-
-def classify_order(order):
-
-    items = order.get(
-        "line_items",
-        []
-    )
-
-    if not items:
-        return True, (
-            "Order contains no readable line items; "
-            "manual review required"
-        )
-
-    # --------------------------------------------
-    # Layer 1: text normalization + exact matching
-    # --------------------------------------------
-
-    for item in items:
-
-        title = item.get(
-            "title",
-            ""
-        )
-
-        match = fuzzy_keyword_match(
-            title
-        )
-
-        if match:
-            return True, match
-
-    # --------------------------------------------
-    # Layer 2: suspicious contextual terms
-    # --------------------------------------------
-
-    combined_text = " ".join(
-        item.get("title", "")
-        for item in items
-    )
-
-    normalized = normalize_text(
-        combined_text
-    )
-
-    for term in SUSPICIOUS_TERMS:
-
-        if normalize_text(term) in normalized:
-            return True, (
-                f"Suspicious context term: {term}"
-            )
-
-    # --------------------------------------------
-    # Layer 3: AI + image screening
-    # --------------------------------------------
-
-    return ai_screen_order(
-        items
-    )
 
 
 # ============================================================
@@ -941,40 +628,28 @@ def classify_order(order):
 # ============================================================
 
 def alert_you(order, reason):
-
     if not RESEND_KEY:
         print(
-            "Email alert skipped: "
-            "RESEND_KEY is missing."
+            "Email alert skipped: RESEND_KEY is missing."
         )
         return False
 
     if not ALERT_EMAIL:
         print(
-            "Email alert skipped: "
-            "ALERT_EMAIL is missing."
+            "Email alert skipped: ALERT_EMAIL is missing."
         )
         return False
 
     resend.api_key = RESEND_KEY
 
     items = [
-        item.get(
-            "title",
-            "Unknown"
-        )
-        for item in order.get(
-            "line_items",
-            []
-        )
+        item.get("title", "Unknown")
+        for item in order.get("line_items", [])
     ]
 
     order_number = order.get(
         "order_number",
-        order.get(
-            "name",
-            "Unknown"
-        )
+        order.get("name", "Unknown")
     )
 
     customer_email = order.get(
@@ -985,23 +660,17 @@ def alert_you(order, reason):
     html = f"""
     <html>
         <body>
-            <h2>🚨 Printora Labs Order Flagged</h2>
+            <h2>Printora Labs Order Requires Review</h2>
 
             <p>
-                A new order requires manual safety review.
+                A new order was automatically sent to manual review.
             </p>
 
             <hr>
 
-            <p>
-                <strong>Order:</strong>
-                #{order_number}
-            </p>
+            <p><strong>Order:</strong> #{order_number}</p>
 
-            <p>
-                <strong>Reason:</strong>
-                {reason}
-            </p>
+            <p><strong>Reason:</strong> {reason}</p>
 
             <p>
                 <strong>Products:</strong>
@@ -1015,48 +684,35 @@ def alert_you(order, reason):
 
             <hr>
 
-            <p>
-                <strong>
-                    FLAGGED-DANGEROUS
-                </strong>
-            </p>
+            <p><strong>Tags:</strong>
+            FLAGGED-DANGEROUS, MANUAL-REVIEW</p>
 
             <p>
-                Do not fulfill this order until it has
-                been manually reviewed.
+                Do not fulfill this order until it has been
+                manually reviewed.
             </p>
         </body>
     </html>
     """
 
     try:
-
-        email = resend.Emails.send(
-            {
-                "from":
-                    RESEND_FROM,
-                "to":
-                    [ALERT_EMAIL],
-                "subject":
-                    (
-                        "🚨 Printora order "
-                        f"#{order_number} "
-                        "requires review"
-                    ),
-                "html":
-                    html,
-            }
-        )
+        email = resend.Emails.send({
+            "from": RESEND_FROM,
+            "to": [ALERT_EMAIL],
+            "subject": (
+                f"Printora order #{order_number} "
+                "requires manual review"
+            ),
+            "html": html,
+        })
 
         print(
-            f"Alert email sent successfully: "
-            f"{email}"
+            f"Alert email sent successfully: {email}"
         )
 
         return True
 
     except Exception as error:
-
         print(
             f"Alert email error: {error}"
         )
@@ -1065,11 +721,10 @@ def alert_you(order, reason):
 
 
 # ============================================================
-# WEBHOOK SECURITY
+# SHOPIFY WEBHOOK HMAC
 # ============================================================
 
 def verify_shopify_hmac(raw_body):
-
     if not SHOPIFY_CLIENT_SECRET:
         print(
             "Webhook rejected: "
@@ -1087,15 +742,11 @@ def verify_shopify_hmac(raw_body):
 
     computed = base64.b64encode(
         hmac.new(
-            SHOPIFY_CLIENT_SECRET.encode(
-                "utf-8"
-            ),
+            SHOPIFY_CLIENT_SECRET.encode("utf-8"),
             raw_body,
             hashlib.sha256
         ).digest()
-    ).decode(
-        "utf-8"
-    )
+    ).decode("utf-8")
 
     return hmac.compare_digest(
         provided,
@@ -1108,20 +759,15 @@ def verify_shopify_hmac(raw_body):
 # ============================================================
 
 def is_duplicate_webhook(webhook_id):
-
     if not webhook_id:
         return False
 
     with processed_lock:
-
         if webhook_id in processed_webhooks:
             return True
 
-        processed_webhooks.add(
-            webhook_id
-        )
+        processed_webhooks.add(webhook_id)
 
-        # Keep memory bounded
         if len(processed_webhooks) > 5000:
             processed_webhooks.clear()
 
@@ -1134,10 +780,8 @@ def is_duplicate_webhook(webhook_id):
 
 @app.route("/", methods=["GET"])
 def home():
-
     return (
-        "Printora Labs Order Screening Bot "
-        "is running!",
+        "Printora Labs Order Screening Bot is running!",
         200
     )
 
@@ -1146,31 +790,14 @@ def home():
 # SHOPIFY WEBHOOK
 # ============================================================
 
-@app.route(
-    "/api/webhook",
-    methods=["POST"]
-)
+@app.route("/api/webhook", methods=["POST"])
 def handle_order():
+    # Keep raw bytes for HMAC verification.
+    raw_body = request.get_data(cache=False)
 
-    raw_body = request.get_data(
-        cache=False
-    )
-
-    # --------------------------------------------
-    # SECURITY: verify Shopify HMAC
-    # --------------------------------------------
-
-    if not verify_shopify_hmac(
-        raw_body
-    ):
-        print(
-            "Rejected webhook: invalid HMAC."
-        )
-
-        return (
-            "Unauthorized",
-            401
-        )
+    if not verify_shopify_hmac(raw_body):
+        print("Rejected webhook: invalid HMAC.")
+        return "Unauthorized", 401
 
     topic = request.headers.get(
         "X-Shopify-Topic",
@@ -1189,63 +816,35 @@ def handle_order():
 
     print(
         f"Received Shopify webhook: "
-        f"{topic} | "
-        f"{shop_domain} | "
-        f"{webhook_id}"
+        f"{topic} | {shop_domain} | {webhook_id}"
     )
-
-    # --------------------------------------------
-    # Only process order creation
-    # --------------------------------------------
 
     if topic != "orders/create":
         return "", 200
 
-    # --------------------------------------------
-    # Duplicate protection
-    # --------------------------------------------
-
-    if is_duplicate_webhook(
-        webhook_id
-    ):
+    if is_duplicate_webhook(webhook_id):
         print(
-            f"Duplicate webhook ignored: "
-            f"{webhook_id}"
+            f"Duplicate webhook ignored: {webhook_id}"
         )
-
         return "", 200
 
-    # --------------------------------------------
-    # Parse JSON
-    # --------------------------------------------
-
     try:
-
-        order = json.loads(
-            raw_body
-        )
-
+        order = json.loads(raw_body)
     except Exception as error:
-
         print(
             f"Invalid JSON webhook: {error}"
         )
+        return "Invalid JSON", 400
 
-        return (
-            "Invalid JSON",
-            400
-        )
+    if not isinstance(order, dict):
+        return "Invalid JSON", 400
 
     order_id = order.get(
         "admin_graphql_api_id"
     )
 
-    # Older payload compatibility
     if not order_id:
-
-        numeric_id = order.get(
-            "id"
-        )
+        numeric_id = order.get("id")
 
         if numeric_id:
             order_id = (
@@ -1254,86 +853,56 @@ def handle_order():
             )
 
     if not order_id:
-
-        print(
-            "Webhook order has no ID."
-        )
-
-        return (
-            "Missing order ID",
-            400
-        )
+        print("Webhook order has no ID.")
+        return "Missing order ID", 400
 
     print(
-        f"Screening Shopify order: "
-        f"{order_id}"
+        f"Screening Shopify order: {order_id}"
     )
 
-    # --------------------------------------------
-    # SCREEN ORDER
-    # --------------------------------------------
-
-    flagged, reason = classify_order(
-        order
-    )
-
-    # --------------------------------------------
-    # FLAGGED
-    # --------------------------------------------
-
-    if flagged:
-
-        print(
-            f"⚠️ ORDER FLAGGED: "
-            f"{order_id} | {reason}"
+    # Fail closed: an exception means manual review.
+    try:
+        approved, reason = classify_order(order)
+    except Exception as error:
+        approved = False
+        reason = (
+            "Screening error; manual review required: "
+            f"{error}"
         )
 
-        # Update Shopify
-        try:
+    if approved:
+        print(
+            f"ORDER APPROVED: {order_id} | {reason}"
+        )
+        return "", 200
 
-            hold_order(
-                order_id,
-                reason
-            )
+    print(
+        f"ORDER MANUAL REVIEW: "
+        f"{order_id} | {reason}"
+    )
 
-            print(
-                "Shopify order updated "
-                "successfully."
-            )
-
-        except Exception as error:
-
-            print(
-                f"Shopify order update failed: "
-                f"{error}"
-            )
-
-        # Email alert
-        email_success = alert_you(
-            order,
+    try:
+        hold_order(
+            order_id,
             reason
         )
 
-        if email_success:
-            print(
-                "Alert email sent successfully."
-            )
-        else:
-            print(
-                "Alert email failed."
-            )
-
-    # --------------------------------------------
-    # APPROVED
-    # --------------------------------------------
-
-    else:
-
         print(
-            f"✅ ORDER APPROVED: "
-            f"{order_id}"
+            "Shopify order tagged for manual review."
         )
 
+    except Exception as error:
+        print(
+            f"Shopify order update failed: {error}"
+        )
+
+    alert_you(
+        order,
+        reason
+    )
+
+    # Return 200 so Shopify does not repeatedly retry an
+    # already-processed manual-review order.
     return "", 200
 
 
@@ -1342,7 +911,6 @@ def handle_order():
 # ============================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=int(
