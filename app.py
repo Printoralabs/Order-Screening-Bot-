@@ -34,11 +34,8 @@ SHOPIFY_TOKEN = os.environ.get("SHOPIFY_TOKEN", "").strip()
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "").strip()
 
-# Shopify webhook HMAC secret
-SHOPIFY_WEBHOOK_SECRET = (
-    os.environ.get("SHOPIFY_WEBHOOK_SECRET", "").strip()
-    or SHOPIFY_CLIENT_SECRET
-)
+# Shopify webhook HMAC uses the Shopify Client Secret directly.
+# No separate SHOPIFY_WEBHOOK_SECRET environment variable is required.
 
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "").strip()
 
@@ -1073,10 +1070,10 @@ def alert_you(order, reason):
 
 def verify_shopify_hmac(raw_body):
 
-    if not SHOPIFY_WEBHOOK_SECRET:
+    if not SHOPIFY_CLIENT_SECRET:
         print(
             "Webhook rejected: "
-            "SHOPIFY_WEBHOOK_SECRET is not configured."
+            "SHOPIFY_CLIENT_SECRET is not configured."
         )
         return False
 
@@ -1090,7 +1087,7 @@ def verify_shopify_hmac(raw_body):
 
     computed = base64.b64encode(
         hmac.new(
-            SHOPIFY_WEBHOOK_SECRET.encode(
+            SHOPIFY_CLIENT_SECRET.encode(
                 "utf-8"
             ),
             raw_body,
